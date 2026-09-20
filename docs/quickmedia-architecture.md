@@ -150,6 +150,40 @@ type Subscription struct { /* reader + 订阅统计 + 取消 */ }
 
 **偏离基线说明**：ZLMediaKit 用 `Frame + Track + MediaSource`，语义等价，字段命名与 MediaMTX 的 unit 模型对齐（调研报告 §3.1/3.2）。此处选择不是折中，是采纳 MediaMTX 侧已被 `sub_stream.go`、`offline_sub_stream*` 验证的粒度。
 
+#### 2.2.1 契约冻结：MVP-0 实现形态与偏差
+
+以下是实现契约的冻结记录（`kernel/stream` + `kernel/path`，MVP-0）。设计与实现的差异全部列在此处；后续改动必须走设计变更评审。
+
+| 设计（§2.2） | 实现 | 说明 |
+|---|---|---|
+| `Unit` 字段 | **完全一致**：`TrackID/Codec/Kind/Payload/PTS/DTS/Duration/Key/Sequence/Flags` | `Sequence uint64` 为 track 内单调序号，由 `streamWriter.prepare` 填入；`Flags UnitFlags` 已实现 `FlagDiscontinuity/FlagConfig/FlagFirstOfPath` 三个位（`UnitFlags.String()` 输出 `config`/`discontinuity`/`first-of-path`） |
+| `Unit.PTS/DTS Time`（NTP 锚定） | `time.Time`，**绝对值** | **MVP-0 用墙上时钟而非 NTP 锚定**；锚定由 publisher 完成，各 egress 适配器再按各自时钟域重锚（FLV/RTMP 重锚到首帧，RTSP 按 RTP 时间戳换算，HLS 交给 muxer） |
+| `Unit.Refs atomic.Int32` | `memory.Refs`，非导出字段，暴露 `Retain()/Release()/RefCount()` | 设计意图一致，只是引用计数下沉到 L0 `memory` 层。**`streamWriter.WriteUnit(u)` 在所有返回路径上都取得 `u` 的所有权**（成功投递、closed、prepare 失败、input 满都 `Release`）——这是全库唯一所有权不变式，调用方写完后不得再读 `u` |
+| `Unit.Payload` 不可变 | 同 | 由 `NewUnit` 复制 payload 保证，不可变约定由测试断言而非类型强制；payload 来自 `container` 打包器，调用方不得就地改写 |
+| `Track` 字段 | **完全一致**：`ID/Codec/Kind/Params/Bandwidth/Timescale` | `Kind CodecKind` 在 MVP-0 由 `stream.KindVideo/KindAudio/KindData` 表达 |
+| `Track.Params map[string]string` | 同，key 固定 | h264: `sps`/`pps`（base16）；aac: `sampleRate`/`numberOfChannels`。这些 key 是 L2/L3 的隐式契约，改动等同破坏 ABI |
+| `Track.ID` 分配 | `path.Manager.Begin` 按声明序分配 `i+1` | 保证同一路径重推后 track id 稳定，也是「TrackID 必须与内核排序一致」注释的落点 |
+| `StreamReader` | `stream.Subscription`，`ReadUnit(ctx)` | 实现加了 `ctx`——无超时的 `ReadUnit` 会在慢消费者上永久阻塞 |
+| `StreamWriter` | `stream.StreamWriter`，`WriteUnit(*Unit)` | 同设计；另有 `Err()/Closed()` 供适配器观察自身会话状态 |
+| `Subscription` 句柄 | `stream.Subscription`：`Tracks/Cancel/Path/Canceled/Reason/Stats` | 订阅的 `Tracks()` 可能为空，**track 表必须从 `PlaySession.Tracks()` 取**（HLS 曾因依赖订阅侧 track 表而拿到空表） |
+| `Stream.SubStream`（按 track 集合分叉） | 未实现 | 多画面/仅音频属 M1+ |
+
+**广播语义（影响所有测试与适配器，非显而易见）**：广播到**无订阅者**的路径的 Unit 直接丢弃（`BroadcastUnit` 对每个订阅者各复制一份，订阅者集合为空即零次复制）。因此订阅必须发生在生产之前——HLS 在首个 playlist 请求时才建 feed，意味着首个分段只有等到有客户端访问才会开始积累。这不是 bug，但任何「先发后收」的编排都会静默丢帧，且日志无告警。
+
+**所有权链（易错点，逐层交代）**：publisher `WriteUnit(u)` → 所有权归 writer（失败也释放）→ worker `Retain` 后 `BroadcastUnit(u)` 并 `Release` 自己的那份 → `BroadcastUnit` 为每个订阅者 `NewUnit` 复制并 `AddUnit`，复制的引用交给 ring 持有，`BroadcastUnit` 不再释放它 → 订阅者 `ReadUnit` 取出后自行 `Release`。全链路唯一会静默产生错误数据的动作是在 `BroadcastUnit` 返回后再释放自己的引用，那是合法的；会崩溃的是让一份引用被两个 ring 共享。
+
+#### 2.2.2 实现缺陷记录（MVP-0，端到端测试驱动发现）
+
+本节记录内核契约本身之外的三处实现缺陷。它们都在 `go build` / `go vet` / 单元测试全绿的状态下存在，是端到端测试跑真实客户端时才暴露的——这是"功能必须测过"这一要求唯一的实证价值，因此记录在契约冻结之后而非并入上表。
+
+| # | 缺陷 | 根因 | 表现 | 修复 |
+|---|---|---|---|---|
+| 1 | RTMP 会话生命周期错配（`adapters/rtmp`） | `Manager.Play` 在适配器注册完 sink 后即返回，早于 egress goroutine 写出第一帧；`ServeConn` 一返回，监听侧的 `acceptRTMP` 立刻 `conn.Close()` | 每个 RTMP 播放端读到配置 tag 后恰好一个视频帧、一个音频帧即 EOF；**所有日志零告警**，因为写失败发生在连接已关闭之后，`Err()` 为空 | `ServeConn` 阻塞到 `<-sink.Done()` 再返回。Publish 侧同理阻塞 `<-src.Done()`。判据：**返回给监听侧的必须是连接的真实生命周期**，manager 侧的 `Done` 监视 goroutine 才是订阅的真实终点 |
+| 2 | FLV 视频 tag 头字节写错（`container/flv.go`） | `flvVideoAVC = 0x01`（实际是 MP3 的 codec id）、`flvFrameKey = 0x40`（实际是保留的 frame_type 4） | 写出的 HTTP-FLV 流被所有真实播放器判为音频/拒绝解码。**内部测试全绿**：断言引用了同一批错误常量，等于把错误当成了期望值 | `flvVideoAVC = 0x07`、`flvFrameKey = 0x10`、新增 `flvFrameInter = 0x20`；`ParseTagType` 的视频判别从 `>>4 == 0x01 \|\| == 0x04` 改为 `== 0x01 \|\| == 0x02` |
+| 3 | 上述修复引入的位运算错误 | frame_type 是 4 位字段，key 与 inter 是**互斥取值**而非可叠加的两位；写成 `base \| inter; if key { base \|= key }` 得 `0x37`（frame_type 3，规范未定义） | 与 #2 同类：写端自己的 key 判定仍通过（codec id 没变），`ParseTagBody` 也拒绝不了，只有真实播放器报错 | 改为赋值 `head = flvVideoAVC \| flvFrameKey`。新增 `TestFLVInterFrameHead` 直接断言首字节 `0x27`，正是为锁定"两个互斥取值被按位或"这一失效模式 |
+
+**可复用结论（对后续里程碑有效）**：L2 容器层凡是与规范位级相关的字节，断言必须**对照规范字面量**（`0x17`/`0x27`/`0xA1`）而非对照实现自身的常量名。断言镜像实现常量时，实现错、断言也错，测试仍然绿——#2 与 #3 都无法被既有测试捕获，就是这个原因。同样地，端到端测试必须驱动**独立实现**的客户端（gortsplib / gortmplib 拉流、字节级校验 FLV tag 与 MPEG-TS），否则"自家写自家读"永远自洽。
+
 ### 2.3 数据面与控制面分离
 
 | | 数据面 | 控制面 |
@@ -292,53 +326,103 @@ TranscoderBackend SPI（L4 Capability 层，内核不实现）
 
 ### 5.1 三类插件，一个注册表
 
+契约以 `kernel/registry` 为准（MVP-0 已实现，下列代码为**实际冻结形态**，设计稿字段名已随实现对齐）。
+
 ```go
 // 插件统一元信息（内核只依赖这一份）
 type ModuleInfo struct {
-    Name       string        // 全局唯一
-    Version    semver.Version
-    Type       ModuleType    // Adapter | Codec | Capability
-    MinKernel  semver.Version
-    Priority   int           // 同 Type 多实现时的选择顺序
+    Name      string       // 全局唯一，如 "rtsp"、"h264"、"recorder"
+    Version   string       // 模块版本，semver 字符串
+    Type      ModuleType   // TAdapter | TCodec | TCapability
+    MinKernel string       // 模块所需最低内核版本
+    Priority  int          // 同 Type 多实现时的选择顺序，大者优先
+    Dir       string       // 实现模块所在目录，仅用于诊断
 }
 
-// A. 协议适配器：既是 source 也是 sink，但能力可分别声明
+// A. 协议适配器：方向分别声明，只推或只放的模块是合法的
 type Adapter interface {
     ModuleInfo() ModuleInfo
+    Schemes() []string                    // 声明处理的 scheme，服务端据此路由
     SupportsScheme(scheme string) bool
-    NewSource(req SourceRequest) (StreamWriter, error)     // 客户端推/外部拉入
-    NewSink(req SinkRequest) (StreamReader, error)         // 服务端推给客户端
-    Hooks() AdapterHooks                                    // OnClose/OnError/OnBandwidth
+    CanPublish() bool
+    CanPlay() bool
+    Publish(ctx context.Context, s PublishSession) (Source, error)
+    Play(ctx context.Context, s PlaySession) (Sink, error)
 }
 
-// B. Codec：负责 ES ↔ RTP/RTMP/TS 的打包与解包
-type CodecPackers interface {
+// 内核交给适配器的是会话，不是协议对象。这是"插件也能跨进程"的前提：
+// 会话把数据（Request）与回调（Begin/Subscribe）包在一起。
+type PublishSession interface {
+    Request() SinkRequest
+    Begin([]*stream.Track) (stream.StreamWriter, error) // 声明 track 表，取写入器
+    Relay() bool
+    PathName() string
+}
+
+type PlaySession interface {
+    Request() SrcRequest
+    Tracks() []*stream.Track                            // 可能为 nil（路径尚未发布）
+    CodecParams() map[stream.CodecID]map[string]string
+    Subscribe(ctx context.Context) (stream.Subscription, error) // 阻塞等待 publisher
+}
+
+// B. Codec：ES ↔ RTP/容器帧 的打包与解包。
+//    设计稿中的 RTMPPacker 已删除：RTMP 的 AVMediaTag 由 L3 适配器组装，
+//    它消费 ContainerPacker 的 ConfigFrames/Pack 结果，不需要独立的打包器家族。
+type CodecPacker interface {
     ModuleInfo() ModuleInfo
-    RTPPacker() (RTPPacker, error)                          // 含 FU-A 分片策略
-    RTPUnpacker() (RTPUnpacker, error)
-    RTMPPacker() (RTMPPacker, error)                        // 可选：不支持即返回 ErrUnsupported
-    ContainerPackers() []ContainerPacker                    // TS/FLV/fMP4
+    ID() stream.CodecID
+    Kind() stream.CodecKind
+    Timescale() uint32
+    RTPParams() map[string]string      // fmtp / codec descriptor 用
+    SetRTPParams(map[string]string)
+    ContainerParams() map[string]string
+    SetContainerParams(map[string]string)
+    SupportsFormat(Format) bool
+    Formats() []Format
+    NewRTPPacker() (RTPPacker, error)
+    NewRTPUnpacker() (RTPUnpacker, error)
+    NewContainerPacker(f Format) (ContainerPacker, error)
+    NewContainerUnpacker(f Format) (ContainerUnpacker, error)
 }
 
-// C. Capability：挂在订阅或 path 上的横向能力
+type RTPPacker interface {
+    Pack(*stream.Unit, uint16, uint32) (packs [][]byte, nextSequence uint16, nextTimestamp uint32)
+    MaxPayload() int
+}
+
+type RTPUnpacker interface {
+    Unpack(payload []byte, sequence uint16, timestamp uint32, marker bool) (*stream.Unit, error)
+}
+
+// C. Capability：挂在订阅上的横向能力（MVP-0 未实现任何 Capability，capabilities/ 目录尚未建立）
 type Capability interface {
     ModuleInfo() ModuleInfo
-    OnAttach(sub Subscription, cfg Config) (CapabilityHandle, error)
-    OnDetach(h CapabilityHandle) error
-    ConfigSchema() ConfigSchema   // 供控制面自动生成配置校验
+    OnAttach(stream.Subscription, CapConfig) (CapHandle, error)
+    OnDetach(CapHandle) error
+    ConfigSchema() []string    // 声明接受的配置 key，控制面据此校验
 }
 ```
 
+**设计稿 → 实现的关键收敛**（评审时需知）：
+
+- `ModuleInfo.Version`/`MinKernel` 从 `semver.Version` 收敛为 `string`。理由：内核只做「非空 + 类型合法」校验（`ModuleInfo.IsValid`），不做版本比较；把 semver 解析下沉到发布脚本比在内核里维护一棵版本树便宜。`MinKernel` 的强制留在 CI。
+- `Adapter.NewSource/NewSink` 收敛为 `Publish(ctx, PublishSession)/Play(ctx, PlaySession)`，返回值从读写器改为 `Source`/`Sink` 会话句柄。理由：适配器持有客户端连接并在自己的 goroutine 里驱动它，内核只需要 `Err()/Done()/Close()/Sub()` 来观察与回收；把读写器直接返给内核会让内核必须替适配器跑读取循环。
+- `Adapter.Hooks() AdapterHooks` 删除。`OnClose/OnError/OnBandwidth` 在 MVP-0 全部由内核统一处理（取消原因经 `stream.CancelReason` 回传订阅者），没有第三方 hook 的挂载点。
+- `CodecPackers`（复数）改名为 `CodecPacker`（单数），并**去掉 `RTMPPacker()`**、**去掉 `ContainerPackers()` 返回列表**——改为 `NewContainerPacker(f Format)` 按格式构造。理由：容器打包器是每 sink 一份、持有分段状态的对象，不是一个模块导出一个全局单例；按格式构造也让「h264 支持 ts/flv，opus 支持 adts/fmp4」这种不规则矩阵无需在结构里留空槽。
+- `Capability.OnAttach(sub, cfg Config) (CapabilityHandle, error)` 实现为 `OnAttach(stream.Subscription, CapConfig) (CapHandle, error)`，`CapConfig = map[string]any`、`CapHandle = any`、`ConfigSchema() []string`。理由：MVP-0 没有 capability，先把契约压到最小可编译形态；类型安全的 schema 校验推迟到 `capabilities/` 真正落地时。
+- 未实现：`ErrUnsupported`（改用返回具体错误）、`CapabilityHandle` 命名、`ConfigSchema` 结构化描述。
+
 **"加模块不改内核"的具体含义（可核验）：**
 
-1. 新增协议 = 新增一个包实现 `Adapter`，并在 `init()` 注册（编译期）。内核 diff 应为 **0 行**。
-2. 新增 codec = 实现 `CodecPackers` + 注册；同时更新能力矩阵（用于协商）。
-3. 新增能力 = 实现 `Capability`；其配置通过 `ConfigSchema` 自动进入控制面校验与文档。
+1. 新增协议 = 新增一个包实现 `Adapter`，并在 `init()` 里 `registry.Register`（编译期）。内核 diff 应为 **0 行**。
+2. 新增 codec = 实现 `CodecPacker` + 注册；同时更新能力矩阵（用于协商）。
+3. 新增能力 = 实现 `Capability`；其配置通过 `ConfigSchema` 声明，进入控制面校验与文档。
 4. 内核新增字段/开关必须走设计变更评审；CI 有 grep 门禁（内核目录禁止出现协议缩写：`rtsp|rtmp|hls|srt|moq|gb28181`）。
 
 **验收口径（易扩展的量化定义）**：
 - 新增一个 P0 级协议适配器（有上游库可依赖时）：**≤ 3 人日**；无上游库（自研栈）：**≤ 15 人日**，且内核 diff = 0 行。
-- 新增 codec 的 RTP/RTMP 打包对：**≤ 1 人日**。
+- 新增 codec 的 RTP/容器打包对：**≤ 1 人日**。
 - 新增能力（如截图）：**≤ 2 人日**。
 上述工时在 M2 阶段用"内部演练任务"实测（真实写一个玩具协议，如 HTTP raw ES），取实测值替换估计值。
 
@@ -501,6 +585,23 @@ kernel  ──(共享内存 Unit ring + UDS 唤醒)──  gateway 进程
 - **内核自研新增的成本**：L2 容器编解码（TS/FLV/fMP4 的打包与解包）与 L0 内存池需要自建测试与 fuzz 投入，估算新增 15–25 人日，摊入 M0–M1；不改变任何对外性能目标。
 - **反悔成本**：低-中。上游锁定通过 `go.mod` 版本锁 + 定期 rebase 管理，风险是上游 API 漂移（需为每个上游库写适配隔离层）。内核自研部分反悔成本为 0（本来就是自己的代码）。
 
+#### 7.5.1 附注：上游可行性复核（M0 实测，2026-09，阻塞项已标）
+
+复核方式不是查活跃度，而是**把每条依赖真正编译并跑通端到端**（`go build ./...` + `go test ./...` 全绿，含 race）。结论按"是否可用 / 用在哪一层 / 限制"记录，供后续评审直接引用。
+
+| 上游 | 版本 | 结论 | 限制与影响 |
+|---|---|---|---|
+| `bluenviron/gortsplib/v5` | v5.3.1 | 可用，RTSP 收/发双向跑通 | **cgo 无关**（顶层无 cgo 文件，可纯 Go 交叉编译）；`Format` 接口**无 `Unpack` 方法**，客户端侧必须用自己的 codec 层解码，无法依赖上游解包 |
+| `bluenviron/gortmplib` | v0.2.1 | 可用，RTMP 收/发双向跑通 | **只提供 `ServerConn`，没有 `NewServer`**：多连接监听需自建 `Accept` 循环，这是 `cmd/quickmedia` 里 `acceptRTMP` 存在的原因。**v1.0.2 需要 Go 1.26**，当前 Go 1.24 无法升级，必须锁在 v0.x |
+| `bluenviron/gohlslib/v2` | v2.2.5 | 可用，HLS 分段跑通 | **纯 muxer**：只做分段与 playlist，不做 HTTP 服务，也不做播放端请求解析，L3 适配器需自行处理 URL 路由与 muxer 挂载 |
+| `pion/webrtc/v4` | v4.2.20 | 可用（loopback ICE + RTP 双向实测通过） | **默认 codec 集无 AAC**（音频仅 Opus/G722/PCMU/PCMA），本项目 L2 只实现 h264 + aac 的打包，因此 **WebRTC 出流需要 Opus 的 L2 打包器，MVP-0 未实现**——这是四协议目标里唯一未完成的一项，见 §8 M0 注记。另：`PendingLocalDescription()` 在采集完成后返回 nil，取 SDP 必须回落 `CurrentLocalDescription()`；`RTPSender` 无 `Kind()`/`Direction()` |
+| `bluenviron/mediacommon/v2` | v2.7.1 | 可用（间接） | 仅作为 SPS/PPS、AudioSpecificConfig 的数据结构载体，被 gortsplib/gortmplib 传递引入 |
+| `moq`（MoQ） | — | **不可用** | 无可解析的 Go module，MoQ 在 MVP-0 排除，待上游稳定后按 §5.1 新增适配器 |
+| SRT | — | **不可用** | 同上，无可解析的 Go module（`gosrt` 需 cgo + 外部库）。列为 M2 决策项，不阻塞 MVP |
+
+**复核结论**：§7.5"分级 + 内核自研"的判定在 MVP-0 成立——RTSP/RTMP/HLS 三条上游直接可用，内核自研三层未被上游替代；WebRTC 可用但**卡在 L2 缺少 Opus 打包器**，属于本项目自己的缺口而非上游不可用，因此不需要按"任一 P0 协议上游不可用则改自研"改道。MoQ 与 SRT 因上游不可解析，明确降级为 M2 项。
+
+
 ### 7.6 是否内建转码
 - **选项**：v1 内建 / v1 外部 worker + v2 内建 / 永远不内建
 - **结论（v0.3 更新，业主拍板）**：**内建**。M2 交付内建转码首版，M3+ 扩展到 GPU 后端矩阵。原"v1 外部 worker、v2 视需求"的保守方案被覆盖；`TranscoderBackend` SPI 保留并作为**唯一**的转码接入点。
@@ -534,8 +635,8 @@ kernel  ──(共享内存 Unit ring + UDS 唤醒)──  gateway 进程
 
 | 阶段 | 交付边界 | 验收证据（硬门槛） |
 |---|---|---|
-| **M0**（1 周，= MVP 阶段 1） | 骨架：L0/L2/L5 三层自研代码落位；跑通 RTSP→RTMP→HLS→WebRTC 全链路；确立 Unit/Track/Stream 数据结构与注册表接口 | ① 四协议端到端视频可播；② `grep` 门禁脚本可在 CI 通过；③ 接口文档评审通过（本文 §2.2 冻结）；④ **上游库可行性复核**（1 天，非阻塞）：核对 gortsplib / gortmplib / gohlslib / pion / moq / gosrt 的活跃度与许可，结论写入 §7.5 附注；任一 P0 协议上游不可用则改自研并评估工时 |
-| **M1**（1–2 月，= MVP 阶段 2） | P0 协议 7 项（RTSP/RTMP/HTTP-FLV/HLS/WebRTC/SRT/TS+RTP）+ Control API + Hooks + Prometheus | ① 性能基线 7 项实测数据（§4.5）全部产出并入库；② 单核 ≥1 万路 RTSP 只读（未达标则给出差距分析与是否降级目标）；③ 每 Unit 拷贝 = 0 的插桩证据；④ `bench` 子命令可复现 |
+| **M0**（1 周，= MVP 阶段 1） | 骨架：L0/L2/L5 三层自研代码落位；跑通 RTSP→RTMP→HTTP-FLV→HLS 全链路；确立 Unit/Track/Stream 数据结构与注册表接口 | **实测结果（2026-09）**：① RTSP 推 → RTMP / HTTP-FLV / HLS 三协议端到端可拉，由 `cmd/quickmedia` 的集成测试驱动真实客户端（gortsplib 推、gortmplib 拉、HTTP-FLV 读头与 tag、HLS 读分段并校验 MPEG-TS 头部与 188 字节对齐）全部断言通过；② `tools/lint/archgate.sh` 本地通过并接入 CI；③ 契约冻结记录见 §2.2.1 与 §5.1（设计稿与实现的差异逐项列出）；④ 上游复核结论见 §7.5.1；⑤ **实测端到端延迟**：RTMP 链路 20 帧回环 **p50 1ms / p95 1ms**（`go test -race` 下，本地回环，含三协议全链路在跑）——这是门槛 ①"可测的延迟数字"而非"编译通过"的证据；⑥ 实现缺陷记录见 §2.2.2（3 处，均为端到端测试驱动发现，其中 2 处在全部单元测试绿的情况下存在）。**WebRTC 未达 M0**：卡点是本项目 L2 缺 Opus 打包器（pion 默认 codec 集不含 AAC），非上游不可用，顺延 M1 并计入 M1 交付边界；MoQ 与 SRT 上游不可解析，降级 M2 |
+| **M1**（1–2 月，= MVP 阶段 2） | P0 协议 7 项（RTSP/RTMP/HTTP-FLV/HLS/**WebRTC（含 Opus L2 打包器，从 M0 顺延）**/SRT/TS+RTP）+ Control API + Hooks + Prometheus | ① 性能基线 7 项实测数据（§4.5）全部产出并入库；② 单核 ≥1 万路 RTSP 只读（未达标则给出差距分析与是否降级目标）；③ 每 Unit 拷贝 = 0 的插桩证据；④ `bench` 子命令可复现 |
 | **M2**（2 月，= MVP 阶段 3） | + MoQ、fMP4 录像、绝对时间戳、always-available、点播+seek、JWT、TS 透传、**内建转码首版**、**内建 SIP 核心栈** | ① WebRTC 单跳 P95 < 300ms、LL-HLS < 1.5s 实测；② 录像回放与直播无缝切换演示；③ **易扩展演练**：新增一个玩具协议 + 1 个 codec + 1 个 capability，实测工时并写入本文 §5.1（内核 diff = 0 行）；④ 内建转码：H.264 跨分辨率转码 + AAC 采样率转换可用，CPU 与 GPU 后端均跑通，吞吐基线入库；⑤ SIP：RFC 3261 注册 / INVITE / BYE 与外部 SIP 测试床（如 SIPp）互通 |
 | **M3**（3 月） | + GB28181（含对讲 + 主动拉流 + 级联）、ONVIF、单端口复用 + 连接迁移、HTTP-TS/fMP4 | ① 与市面主流 NVR/平台对接联调报告（≥3 款设备）；② 连接迁移在断网重连场景的恢复时间实测（目标 ≤3s）；③ E2 拓扑（read replica）跑通并给出溯源带宽数据 |
 | **M4**（3–6 月） | + 集群（E3 会话迁移）、S3 录像直写、进程外 gateway 契约落地（NDI 或国标 C 网关其一）、SDK/文档 | ① 故障转移演练：source 节点 kill → reader 恢复 ≤3s（P95）；② ≥1 个第三方协议以 gateway 形态接入且内核 diff = 0；③ 集群模式下总并发 ≥ 单机 3 倍（给出拓扑与瓶颈分析） |

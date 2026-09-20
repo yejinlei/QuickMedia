@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # -race is not optional: it is what caught the channel-close race in the
+        # composition-root integration test. -count=1 defeats the test cache so a
+        # green build can never be a stale one.
+        run: go test -count=1 -race ./...
+
+      # Architecture gate. This is the check that keeps the media plane free of
+      # protocol names and the transport layer free of codec names; it fails the
+      # build when either layer starts to know about the other.
+      - name: Architecture gate
+        run: bash tools/lint/archgate.sh
