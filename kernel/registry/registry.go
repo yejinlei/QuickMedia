@@ -290,6 +290,12 @@ const (
 	FormatADTS Format = "adts"
 	// FormatAnnexB is raw Annex-B video NAL units.
 	FormatAnnexB Format = "annexb"
+	// FormatOpus is Ogg-multiplexed Opus. The name names the container rather
+	// than the codec because a codec identifier never appears in this package:
+	// it would couple the contract to one module. Opus is the only codec that
+	// has exactly one standard container, so the two are interchangeable in
+	// practice, but the direction of the dependency matters.
+	FormatOpus Format = "opus"
 )
 
 // RTPPacker turns one unit into transport payloads.
