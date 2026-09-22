@@ -30,6 +30,7 @@ package rtsp
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -100,6 +101,9 @@ type Server struct {
 	bySession map[*gortsplib.ServerSession]*pubSession
 
 	rtspAddr, rtpAddr, rtcpAddr, multicast string
+	// tls is the RTSPS credential set; nil means the control port stays
+	// plaintext RTSP only.
+	tls *tls.Config
 }
 
 // pubSession is one inbound stream: the client's source, the kernel writer it
@@ -156,6 +160,12 @@ type Options struct {
 	UDPRTCPAddress string
 	// MulticastIPRange allows multicast transports. Empty disables it.
 	MulticastIPRange string
+	// TLS is the tls.Config for RTSPS on the same control port. gortsplib
+	// multiplexes RTSP and RTSPS on one socket: an RTSPS client negotiates a
+	// TLS handshake, an RTSP client does not. A nil config keeps the port
+	// plaintext-only, which is the default because a self-signed cert is not
+	// the right default for a production listener.
+	TLS *tls.Config
 }
 
 // NewServer builds the listener. It does not bind; Start does.
@@ -173,6 +183,7 @@ func NewServer(m *path.Manager, opts Options) *Server {
 		s.rtspAddr = ":8554"
 	}
 	s.rtpAddr, s.rtcpAddr, s.multicast = opts.UDPRTPAddress, opts.UDPRTCPAddress, opts.MulticastIPRange
+	s.tls = opts.TLS
 	return s
 }
 
@@ -188,6 +199,7 @@ func (s *Server) Start(ctx context.Context) error {
 		UDPRTPAddress:    s.rtpAddr,
 		UDPRTCPAddress:   s.rtcpAddr,
 		MulticastIPRange: s.multicast,
+		TLSConfig:        s.tls,
 	}
 	// Start is non-blocking and, once it returns, sets the session table that
 	// ServerStream.Initialize checks. Binding before returning is what makes a

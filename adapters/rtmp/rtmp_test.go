@@ -5,10 +5,12 @@ package rtmp
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"github.com/yejinlei/quickmedia/kernel/path"
 	"github.com/yejinlei/quickmedia/kernel/registry"
 	"github.com/yejinlei/quickmedia/kernel/stream"
+	"github.com/yejinlei/quickmedia/testtls"
 	"github.com/yejinlei/quickmedia/transport"
 )
 
@@ -160,11 +163,20 @@ type rtmResult struct {
 // which is what this channel is a stand-in for.
 func connectRTMP(t *testing.T, addr, app string, publish bool) *rtConn {
 	t.Helper()
-	u, err := url.Parse("rtmp://" + addr + "/" + app)
+	return connectRTMPS(t, addr, app, publish, nil)
+}
+
+// connectRTMPS is connectRTMP with an optional TLS config: the rtmp:// scheme
+// takes a plaintext dialer, the rtmps:// scheme takes a TLS dialer. Nothing
+// else differs, which is the property that makes the RTMPS path a variant of
+// RTMP rather than a second adapter.
+func connectRTMPS(t *testing.T, addr, app string, publish bool, cfg *tls.Config) *rtConn {
+	t.Helper()
+	u, err := url.Parse(schemeOf(cfg) + "://" + addr + "/" + app)
 	if err != nil {
 		t.Fatalf("parse url: %v", err)
 	}
-	c := &gortmplib.Client{URL: u, Publish: publish}
+	c := &gortmplib.Client{URL: u, TLSConfig: cfg, Publish: publish}
 	if err := c.Initialize(context.Background()); err != nil {
 		t.Fatalf("rtmp initialize: %v", err)
 	}
@@ -194,6 +206,214 @@ func connectRTMP(t *testing.T, addr, app string, publish bool) *rtConn {
 	}()
 	t.Cleanup(func() { close(done) })
 	return r
+}
+
+// schemeOf is the URL scheme a client must use when talking to a listener that
+// either wraps connections in TLS or does not.
+func schemeOf(cfg *tls.Config) string {
+	if cfg == nil {
+		return "rtmp"
+	}
+	return "rtmps"
+}
+
+// --- RTMPS -----------------------------------------------------------------
+
+// TestRTMPPublishTLS is the RTMPS variant of TestRTMPPublish: the same ingest
+// flow with a TLS listener and a TLS client, and the same assertions on the
+// kernel path. If the TLS variant produced a different path than the plaintext
+// variant, this test would catch it — which is the property an operator relies
+// on when they switch a port to RTMPS.
+func TestRTMPPublishTLS(t *testing.T) {
+	m := path.NewManager(path.DefaultConfig())
+	m.Open()
+	defer m.Close()
+
+	dir := t.TempDir()
+	cfg, err := testtls.Generate(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatalf("tls config: %v", err)
+	}
+
+	ln, err := transport.NewListener(context.Background(), "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var wg sync.WaitGroup
+	go func() {
+		for {
+			conn, err := ln.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := ServeConn(context.Background(), conn, m); err != nil {
+					t.Logf("session ended: %v", err)
+					_ = conn.Close()
+					return
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { ln.Close(); wg.Wait() })
+
+	c := connectRTMPS(t, ln.Addr(), "live/test", true, testtls.InsecureClient())
+
+	w := &gortmplib.Writer{Conn: c.c, Tracks: rtmpTracks()}
+	if err := w.Initialize(); err != nil {
+		t.Fatalf("rtmp writer: %v", err)
+	}
+
+	bodies := make([][]byte, 0, 3)
+	for _, n := range container.ParseAU(h264.SyntheticAU(true)) {
+		bodies = append(bodies, n.Data)
+	}
+	if len(bodies) == 0 {
+		t.Fatal("the fixture produced no access unit")
+	}
+	wantAU := h264.SyntheticAU(true)
+
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for i := range 55 {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			dts := time.Duration(i) * frameInterval
+			if err := w.WriteH264(w.Tracks[0], dts, dts, bodies); err != nil {
+				t.Logf("publish stopped: %v", err)
+				return
+			}
+			if err := w.WriteMPEG4Audio(w.Tracks[1], dts, aau); err != nil {
+				t.Logf("publish stopped: %v", err)
+				return
+			}
+			time.Sleep(3 * time.Millisecond)
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.PathCount() > 0 && len(m.Paths()[0].Tracks) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := m.PathCount(); got != 1 {
+		t.Fatalf("path count = %d, want 1", got)
+	}
+	paths := m.Paths()
+	if len(paths) != 1 || paths[0].Name != "live/test" {
+		t.Fatalf("paths = %+v, want one path named live/test", paths)
+	}
+	trks := paths[0].Tracks
+	if len(trks) != 2 {
+		t.Fatalf("tracks = %d, want 2", len(trks))
+	}
+	if trks[0].Codec != codecH264 || trks[1].Codec != codecAAC {
+		t.Fatalf("codes = %s,%s, want h264,aac", trks[0].Codec, trks[1].Codec)
+	}
+	if trks[0].Params["sps"] != hex.EncodeToString(h264.SyntheticSPS()) {
+		t.Fatal("the sps did not survive the encrypted wire intact")
+	}
+	if trks[0].Params["pps"] != hex.EncodeToString(h264.SyntheticPPS()) {
+		t.Fatal("the pps did not survive the encrypted wire intact")
+	}
+
+	// The subscriber must read what the publisher sent, byte for byte, over
+	// TLS: the encryption must not touch the codec descriptors.
+	sub, err := m.Subscribe(context.Background(), "live/test", 0)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	t.Cleanup(func() { sub.Cancel() })
+
+	var videoGot, audioGot bool
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for !videoGot || !audioGot {
+		u, err := sub.ReadUnit(sctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		switch u.Codec {
+		case codecH264:
+			if bytesEqual(u.Payload, wantAU) {
+				videoGot = true
+			}
+			if !u.Key {
+				t.Fatal("an IDR access unit arrived not marked as a keyframe")
+			}
+		case codecAAC:
+			if bytesEqual(u.Payload, aau) {
+				audioGot = true
+			}
+		default:
+			t.Fatalf("unexpected codec %s", u.Codec)
+		}
+		u.Release()
+	}
+	t.Logf("published via rtmps: %d tracks, %d bytes sent", len(trks), c.c.BytesSent())
+}
+
+// TestRTMPPublishTLSRefusesPlaintext asserts the security property an operator
+// turns on RTMPS for: a client that does not negotiate TLS must not be able to
+// publish, which is what protects the stream from passive on-path attackers
+// who would otherwise need to speak only RTMP to inject traffic.
+func TestRTMPPublishTLSRefusesPlaintext(t *testing.T) {
+	m := path.NewManager(path.DefaultConfig())
+	m.Open()
+	defer m.Close()
+
+	dir := t.TempDir()
+	cfg, err := testtls.Generate(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatalf("tls config: %v", err)
+	}
+	ln, err := transport.NewListener(context.Background(), "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	var wg sync.WaitGroup
+	go func() {
+		for {
+			conn, err := ln.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := ServeConn(context.Background(), conn, m); err != nil {
+					t.Logf("session ended: %v", err)
+					_ = conn.Close()
+				}
+			}()
+		}
+	}()
+
+	// A plaintext dialer must fail: the first byte the server expects is a
+	// TLS ClientHello, and an RTMP handshake is not one. The path must not
+	// be created, which is what a broken check that treats a failed
+	// handshake as a successful connection would otherwise allow.
+	u, err := url.Parse("rtmp://" + ln.Addr() + "/live/test")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := &gortmplib.Client{URL: u, Publish: true}
+	if err := c.Initialize(context.Background()); err == nil {
+		c.Close()
+		t.Fatal("a plaintext client was accepted by an RTMPS listener")
+	}
+	if m.PathCount() != 0 {
+		t.Fatalf("path count = %d, want 0 for a refused plaintext connection", m.PathCount())
+	}
 }
 
 // readWithTimeout waits up to d for one message on the connection.

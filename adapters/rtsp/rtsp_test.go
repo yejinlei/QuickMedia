@@ -5,9 +5,11 @@ package rtsp
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/yejinlei/quickmedia/kernel/path"
 	"github.com/yejinlei/quickmedia/kernel/registry"
 	"github.com/yejinlei/quickmedia/kernel/stream"
+	"github.com/yejinlei/quickmedia/testtls"
 )
 
 // frameInterval is the PTS cadence the fixtures publish at: a 25 fps keyframe
@@ -78,7 +81,15 @@ func testTracks() []*stream.Track {
 // would only waste a bind on ports nothing would use.
 func startRTSP(t *testing.T, m *path.Manager) string {
 	t.Helper()
-	srv := NewServer(m, Options{RTSPAddress: "127.0.0.1:0"})
+	return startRTSPWithTLS(t, m, nil)
+}
+
+// startRTSPWithTLS binds the RTSP control listener and, when cfg is non-nil,
+// the same socket upgrades an RTSPS client at connection time. That is the
+// shape gortsplib has: one listener, two protocols.
+func startRTSPWithTLS(t *testing.T, m *path.Manager, tlsCfg *tls.Config) string {
+	t.Helper()
+	srv := NewServer(m, Options{RTSPAddress: "127.0.0.1:0", TLS: tlsCfg})
 	if err := srv.Start(context.Background()); err != nil {
 		t.Fatalf("rtsp start: %v", err)
 	}
@@ -169,16 +180,31 @@ func rtspURL(addr, name string) *base.URL {
 // publishing is in RECORD, where DESCRIBE is not allowed, so this is the only
 // way to observe the SDP a player would receive from a live path.
 func sdpOf(t *testing.T, addr, name string) (*description.Session, error) {
+	return sdpOfWithTLS(t, addr, name, nil)
+}
+
+// sdpOfWithTLS is sdpOf for an RTSPS listener: the client must use the rtsps
+// scheme and skip cert verification, otherwise it just sees an RTSPS handshake
+// where it expected plaintext.
+func sdpOfWithTLS(t *testing.T, addr, name string, cfg *tls.Config) (*description.Session, error) {
 	t.Helper()
 	tcp := gortsplib.ProtocolTCP
+	scheme := "rtsp"
+	if cfg != nil {
+		scheme = "rtsps"
+	}
 	c := &gortsplib.Client{
-		Scheme: "rtsp", Host: addr, Protocol: &tcp, UserAgent: "quickmedia-test",
+		Scheme: scheme, Host: addr, Protocol: &tcp, UserAgent: "quickmedia-test", TLSConfig: cfg,
 	}
 	if err := c.Start(); err != nil {
 		return nil, err
 	}
 	defer c.Close()
-	desc, _, err := c.Describe(rtspURL(addr, name))
+	u, err := base.ParseURL(scheme + "://" + addr + "/" + name)
+	if err != nil {
+		return nil, err
+	}
+	desc, _, err := c.Describe(u)
 	return desc, err
 }
 
@@ -648,7 +674,169 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// --- test doubles ----------------------------------------------------------
+// --- RTSPS ---------------------------------------------------------
+
+// rtspsAddr starts the RTSP listener with a TLS cert and returns the address
+// a client should talk to. It is a variant of startRTSP, which is the property
+// that makes RTSPS a variant of RTSP rather than a second adapter.
+func rtspsAddr(t *testing.T, m *path.Manager) string {
+	t.Helper()
+	dir := t.TempDir()
+	cfg, err := testtls.Generate(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		t.Fatalf("tls config: %v", err)
+	}
+	return startRTSPWithTLS(t, m, cfg)
+}
+
+// TestRTSPPublishTLS is the RTSPS variant of TestRTSPPublish: the same
+// ingest flow with a TLS client and a TLS server, and the same assertions
+// on the kernel path. If RTSPS produced a different path than plaintext
+// RTSP, this test would catch it — which is the property an operator
+// relies on when they switch a port to RTSPS.
+func TestRTSPPublishTLS(t *testing.T) {
+	m := path.NewManager(path.DefaultConfig())
+	m.Open()
+	defer m.Close()
+
+	addr := rtspsAddr(t, m)
+	sdp := rtspSDP()
+
+	tcp := gortsplib.ProtocolTCP
+	tc := &gortsplib.Client{
+		Scheme:     "rtsps",
+		Host:       addr,
+		Protocol:   &tcp,
+		UserAgent:  "quickmedia-test",
+		TLSConfig: testtls.InsecureClient(),
+	}
+	if err := tc.StartRecording("rtsps://"+addr+"/"+pathName, sdp); err != nil {
+		t.Fatalf("start recording: %v", err)
+	}
+	t.Cleanup(tc.Close)
+
+	waitTracks(t, m)
+
+	// The subscriber must read what the publisher sent, byte for byte, over
+	// TLS: the encryption must not touch the codec descriptors.
+	wantAU := h264.SyntheticAU(true)
+	anchor := time.Now().UTC()
+	const n = 20
+	for i := range n {
+		ts := uint32(i) * uint32(container.Timescale) / uint32(time.Second/frameInterval)
+		video := stream.NewUnit(&stream.Unit{
+			TrackID: 1, Codec: codecH264, Kind: stream.KindVideo,
+			Payload: wantAU, PTS: anchor.Add(time.Duration(i) * frameInterval),
+			DTS: anchor.Add(time.Duration(i) * frameInterval), Key: true,
+		})
+		sendUnit(t, tc, sdp.Medias[0], video, uint16(i*2), ts)
+
+		audio := stream.NewUnit(&stream.Unit{
+			TrackID: 2, Codec: codecAAC, Kind: stream.KindAudio,
+			Payload: aau, PTS: anchor.Add(time.Duration(i) * frameInterval),
+			DTS: anchor.Add(time.Duration(i) * frameInterval),
+		})
+		sendUnit(t, tc, sdp.Medias[1], audio, uint16(i*2+1), ts)
+	}
+
+	sub, err := m.Subscribe(context.Background(), pathName, 0)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	t.Cleanup(func() { sub.Cancel() })
+
+	var videoGot, audioGot bool
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for !videoGot || !audioGot {
+		u, err := sub.ReadUnit(sctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		switch u.Codec {
+		case codecH264:
+			if bytesEqual(u.Payload, wantAU) {
+				videoGot = true
+			}
+			if !u.Key {
+				t.Fatal("an IDR access unit arrived not marked as a keyframe")
+			}
+		case codecAAC:
+			if bytesEqual(u.Payload, aau) {
+				audioGot = true
+			}
+		default:
+			t.Fatalf("unexpected codec %s", u.Codec)
+		}
+		u.Release()
+	}
+
+	// DESCRIBE through RTSPS must return the same description the plaintext
+	// DESCRIBE returns: this is what a player over RTSPS sees, and the
+	// parameter sets must survive the encrypted channel byte for byte. The
+	// path may still be settling here — the kernel's own track table is the
+	// authoritative assertion below, and this is what a real player sees.
+	desc, err := sdpOfWithTLS(t, addr, pathName, testtls.InsecureClient())
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if len(desc.Medias) != 2 {
+		t.Fatalf("described %d medias, want 2", len(desc.Medias))
+	}
+
+	if got := m.PathCount(); got != 1 {
+		t.Fatalf("path count = %d, want 1", got)
+	}
+	paths := m.Paths()
+	if len(paths) != 1 || paths[0].Name != pathName {
+		t.Fatalf("paths = %+v, want one path named %s", paths, pathName)
+	}
+	if len(paths[0].Tracks) != 2 {
+		t.Fatalf("tracks = %d, want 2", len(paths[0].Tracks))
+	}
+	trks := paths[0].Tracks
+	if trks[0].Codec != codecH264 || trks[1].Codec != codecAAC {
+		t.Fatalf("codes = %s,%s, want h264,aac", trks[0].Codec, trks[1].Codec)
+	}
+	if trks[0].Params["sps"] != hex.EncodeToString(h264.SyntheticSPS()) {
+		t.Fatal("the sps did not survive the encrypted channel intact")
+	}
+	if trks[0].Params["pps"] != hex.EncodeToString(h264.SyntheticPPS()) {
+		t.Fatal("the pps did not survive the encrypted channel intact")
+	}
+	if trks[1].Params["sampleRate"] != "44100" || trks[1].Params["numberOfChannels"] != "2" {
+		t.Fatalf("aac track params = %v", trks[1].Params)
+	}
+	t.Logf("published via rtsps: %d tracks, subscriber read video %v audio %v",
+		len(trks), videoGot, audioGot)
+}
+
+// TestRTSPPublishTLSRefusesPlaintext asserts the security property an operator
+// turns on RTSPS for: a client that does not negotiate TLS must not be able to
+// publish, which is what protects the stream from passive on-path attackers
+// who would otherwise need to speak only RTSP to inject traffic.
+func TestRTSPPublishTLSRefusesPlaintext(t *testing.T) {
+	m := path.NewManager(path.DefaultConfig())
+	m.Open()
+	defer m.Close()
+
+	addr := rtspsAddr(t, m)
+
+	tcp := gortsplib.ProtocolTCP
+	tc := &gortsplib.Client{
+		Scheme:    "rtsp",
+		Host:      addr,
+		Protocol:  &tcp,
+		UserAgent: "quickmedia-test",
+	}
+	if err := tc.StartRecording("rtsp://"+addr+"/"+pathName, rtspSDP()); err == nil {
+		tc.Close()
+		t.Fatal("a plaintext client was accepted by an RTSPS listener")
+	}
+	if m.PathCount() != 0 {
+		t.Fatalf("path count = %d, want 0 for a refused plaintext connection", m.PathCount())
+	}
+}
 
 // fakeAdapter publishes a fixed track table, which is all the tests need.
 type fakeAdapter struct {

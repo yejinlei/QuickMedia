@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -63,6 +64,12 @@ type Config struct {
 	WebRtcToken  string
 	WHEPPath     string
 	WHIPPath     string
+	// RTSPSCert and RTSPSKey enable RTSPS on the same control port as RTSP.
+	RTSPSCert string
+	RTSPSKey  string
+	// RTMPSCert and RTMPSKey enable RTMPS on the same control port as RTMP.
+	RTMPSCert string
+	RTMPSKey  string
 }
 
 // LoadConfig applies the defaults and then the flags. An empty address binds an
@@ -98,6 +105,10 @@ func LoadConfig() *Config {
 	flag.StringVar(&c.WebRtcToken, "webtoken", "", "Bearer token required on the WebRTC endpoints")
 	flag.StringVar(&c.WHEPPath, "wheppath", c.WHEPPath, "WHEP (play) HTTP path")
 	flag.StringVar(&c.WHIPPath, "whippath", c.WHIPPath, "WHIP (publish) HTTP path")
+	flag.StringVar(&c.RTSPSCert, "rtsp-cert", "", "RTSPS certificate (PEM); with --rtsp-key enables RTSPS on the RTSP port")
+	flag.StringVar(&c.RTSPSKey, "rtsp-key", "", "RTSPS key (PEM)")
+	flag.StringVar(&c.RTMPSCert, "rtmp-cert", "", "RTMPS certificate (PEM); with --rtmp-key enables RTMPS on the RTMP port")
+	flag.StringVar(&c.RTMPSKey, "rtmp-key", "", "RTMPS key (PEM)")
 	flag.Parse()
 	return c
 }
@@ -125,10 +136,23 @@ func run(c *Config) (runResult, error) {
 	mgr := path.NewManager(cfg)
 	mgr.Open()
 
+	// TLS variants. An empty cert/key pair leaves the plaintext port alone;
+	// a half-set pair is a misconfiguration and fails fast rather than
+	// binding and then refusing every handshake.
+	rtspTLS, err := transport.TLSOptions{CertFile: c.RTSPSCert, KeyFile: c.RTSPSKey}.Config()
+	if err != nil {
+		return nilResult, err
+	}
+	rtmpTLS, err := transport.TLSOptions{CertFile: c.RTMPSCert, KeyFile: c.RTMPSKey}.Config()
+	if err != nil {
+		return nilResult, err
+	}
+
 	rtspSrv := rtsp.NewServer(mgr, rtsp.Options{
 		RTSPAddress:    c.RTSPAddr,
 		UDPRTPAddress:  c.RTPRTP,
 		UDPRTCPAddress: c.RTPRTCP,
+		TLS:            rtspTLS,
 	})
 	if err := rtspSrv.Start(context.Background()); err != nil {
 		return nilResult, fmt.Errorf("rtsp: %w", err)
@@ -177,15 +201,20 @@ func run(c *Config) (runResult, error) {
 	// RTMP needs a raw TCP listener rather than an http.Handler, so it gets a
 	// transport.Listener and an accept loop that hands each connection to the
 	// adapter's ServeConn.
-	rtmpLn, err := transport.NewListener(context.Background(), c.RTMPAddr, nil)
+	rtmpLn, err := transport.NewListener(context.Background(), c.RTMPAddr, rtmpTLS)
 	if err != nil {
 		return nilResult, fmt.Errorf("rtmp listener: %w", err)
 	}
 	go acceptRTMP(context.Background(), rtmpLn, mgr)
 
-	// Every address here is what the listener bound to, not what was configured.
-	log.Printf("QuickMedia ready: rtsp %s, rtmp %s, http %s (adapters: %s)",
-		rtspSrv.Addr(), rtmpLn.Addr(), ln.Addr(), registry.Names(registry.TAdapter))
+	// Every address here is what the listener bound to, not what was
+	// configured. The protocol suffix reports which variants are
+	// actually listening, so an operator can tell at a glance that the
+	// cert flags were picked up rather than silently ignored.
+	log.Printf("QuickMedia ready: rtsp %s (%s), rtmp %s (%s), http %s (adapters: %s)",
+		rtspSrv.Addr(), tlsName("RTSP", "RTSPS", rtspTLS),
+		rtmpLn.Addr(), tlsName("RTMP", "RTMPS", rtmpTLS),
+		ln.Addr(), registry.Names(registry.TAdapter))
 
 	return runResult{
 		RTSP: rtspSrv.Addr(),
@@ -225,6 +254,17 @@ type netAddr string
 
 func (a netAddr) Network() string { return "tcp" }
 func (a netAddr) String() string  { return string(a) }
+
+// tlsName reports which variant of a protocol a listener is serving: the
+// plaintext form when no cert was loaded, the TLS form otherwise. It is the
+// readiness log's only view into whether the operator's cert flags took
+// effect, which is the failure an operator has the hardest time noticing.
+func tlsName(plain, tlsForm string, cfg *tls.Config) string {
+	if cfg == nil {
+		return plain
+	}
+	return tlsForm
+}
 
 // acceptRTMP runs the RTMP listener. Each connection is one session, so a new
 // goroutine per connection is the correct shape: an RTMP publisher holds its
