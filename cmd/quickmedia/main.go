@@ -31,13 +31,16 @@ import (
 	_ "github.com/yejinlei/quickmedia/adapters/httpflv"
 	_ "github.com/yejinlei/quickmedia/adapters/rtmp"
 	_ "github.com/yejinlei/quickmedia/adapters/rtsp"
+	_ "github.com/yejinlei/quickmedia/adapters/webtc"
 	_ "github.com/yejinlei/quickmedia/container/aac"
 	_ "github.com/yejinlei/quickmedia/container/h264"
+	_ "github.com/yejinlei/quickmedia/container/opus"
 
 	"github.com/yejinlei/quickmedia/adapters/hls"
 	hhttpflv "github.com/yejinlei/quickmedia/adapters/httpflv"
 	"github.com/yejinlei/quickmedia/adapters/rtmp"
 	"github.com/yejinlei/quickmedia/adapters/rtsp"
+	"github.com/yejinlei/quickmedia/adapters/webtc"
 	"github.com/yejinlei/quickmedia/kernel/path"
 	"github.com/yejinlei/quickmedia/kernel/registry"
 	"github.com/yejinlei/quickmedia/transport"
@@ -56,6 +59,10 @@ type Config struct {
 	RingSize     int
 	Retain       time.Duration
 	Heartbeat    time.Duration
+	STUNServer   string
+	WebRtcToken  string
+	WHEPPath     string
+	WHIPPath     string
 }
 
 // LoadConfig applies the defaults and then the flags. An empty address binds an
@@ -73,6 +80,8 @@ func LoadConfig() *Config {
 		RingSize:     512,
 		Retain:       5 * time.Second,
 		Heartbeat:    10 * time.Second,
+		WHEPPath:     "/whep",
+		WHIPPath:     "/whip",
 	}
 	flag.StringVar(&c.RTSPAddr, "rtsp", c.RTSPAddr, "RTSP control port")
 	flag.StringVar(&c.RTMPAddr, "rtmp", c.RTMPAddr, "RTMP control port")
@@ -85,6 +94,10 @@ func LoadConfig() *Config {
 	flag.IntVar(&c.RingSize, "ring", c.RingSize, "per-subscriber queue depth")
 	flag.DurationVar(&c.Retain, "retain", c.Retain, "path retain window after a publisher leaves")
 	flag.DurationVar(&c.Heartbeat, "heartbeat", c.Heartbeat, "slow-consumer timeout")
+	flag.StringVar(&c.STUNServer, "stun", "", "WebRTC STUN URL; empty means host candidates only")
+	flag.StringVar(&c.WebRtcToken, "webtoken", "", "Bearer token required on the WebRTC endpoints")
+	flag.StringVar(&c.WHEPPath, "wheppath", c.WHEPPath, "WHEP (play) HTTP path")
+	flag.StringVar(&c.WHIPPath, "whippath", c.WHIPPath, "WHIP (publish) HTTP path")
 	flag.Parse()
 	return c
 }
@@ -137,6 +150,15 @@ func run(c *Config) (runResult, error) {
 	// would serve the path named "live" rather than "stream", and the server
 	// could only ever offer one HLS path per mount. The path is what an operator
 	// puts in the URL, exactly as HTTP-FLV takes it from its own.
+	// WebRTC shares the HTTP listener with HLS and HTTP-FLV. Its paths are
+	// registered before the catch-all so a WHIP offer is not served as a FLV
+	// stream.
+	webtcSrv := webtc.NewServer(mgr, webtc.Options{
+		WHEPPath: c.WHEPPath, WHIPPath: c.WHIPPath,
+		STUNServer: c.STUNServer, AuthToken: c.WebRtcToken,
+	})
+	webtcSrv.Handle(mux)
+
 	mux.Handle("/live/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r2 := *r
 		r2.URL.Path = strings.TrimPrefix(r.URL.Path, "/live")
@@ -176,6 +198,7 @@ func run(c *Config) (runResult, error) {
 				_ = httpSrv.Shutdown(ctx)
 			},
 			rtspSrv.Close,
+			webtcSrv.Close,
 			func() { _ = rtmpLn.Close() },
 			hlsSrv.Close,
 			mgr.Close,
