@@ -1,0 +1,15 @@
+# Multica / agent runtime state (not project source)
+.claude/
+.multica/
+CLAUDE.md
+
+# editor scratch
+*.swp
+*.swo
+
+# build output
+bin/
+dist/
+*.exe
+*.test
+coverage.out
